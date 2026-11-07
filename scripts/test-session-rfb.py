@@ -2,7 +2,7 @@
 """Exercise the real C bridge against a deterministic loopback RFB/ARD fixture.
 No macOS accounts or Keychain credentials are used. Requires libvncserver headers/runtime.
 """
-import hashlib, pathlib, socket, struct, subprocess, tempfile, threading
+import hashlib, os, pathlib, socket, struct, subprocess, tempfile, threading, time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PRIME = int('''FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E08
@@ -15,6 +15,7 @@ A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE6
 6039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF695581718399549
 7CEA956AE515D2261898FA051015728E5A8AACAA68FFFFFFFFFFFFFFFF'''.replace('\n',''), 16)
 PIXELS = bytes([0,0,255,0, 0,255,0,0, 255,0,0,0, 255,255,255,0])
+SUCCESS_MODES = ['success','pending','zero-display','displayinfo2','pseudo1105','partial','retina','encrypted-pointer','encrypted-retina']
 
 def receive(c, n):
     result = b''
@@ -25,6 +26,10 @@ def receive(c, n):
     return result
 
 def fixture(listener, mode, events, errors):
+    started = time.monotonic()
+    encrypted_pointer = True # Shipping backend accepts encrypted ARD input only
+    if mode == 'encrypted-pointer': mode = 'success'
+    if mode == 'encrypted-retina': mode = 'retina'
     try:
         with listener.accept()[0] as c:
             c.settimeout(8)
@@ -58,7 +63,7 @@ def fixture(listener, mode, events, errors):
             fmt=struct.pack('!BBBBHHHBBB3x',32,24,0,1,255,255,255,16,8,0)
             flags = 0 if mode == 'console-only' else 4
             name = b'\x00\x00'+struct.pack('!I',flags)+bytes(16)+b'fixture-agent\x00'
-            size = 0 if mode in ['zero-display','displayinfo2','pseudo1105'] else 2
+            size = 0 if mode in ['zero-display','displayinfo2','pseudo1105','retina'] else 2
             c.sendall(struct.pack('!HH',size,size)+fmt+struct.pack('!I',len(name))+name)
             if mode == 'console-only':
                 assert c.recv(1) == b''
@@ -80,6 +85,8 @@ def fixture(listener, mode, events, errors):
             assert receive(c,8) == bytes([13,1,0,0,0,0,0,0]) # display info request
             assert receive(c,8) == bytes([21,0,0,0,0,0,0,0]) # clipboard disabled
             sent_frame = False
+            partial_complete = False
+            dimensions = 4 if mode == 'retina' else 2
             while True:
                 try: kind=receive(c,1)[0]
                 except EOFError: break
@@ -87,9 +94,9 @@ def fixture(listener, mode, events, errors):
                 elif kind == 2:
                     header=receive(c,3); encodings=receive(c,struct.unpack('!H',header[1:])[0]*4)
                     assert struct.pack('!i',1101) in encodings
-                    if mode in ['displayinfo2','pseudo1105']:
-                        body=struct.pack('!HHHHHIIH',1,2,2,2,2,0,0,0)
-                        if mode == 'displayinfo2': c.sendall(b'\x51'+struct.pack('!H',len(body))+body)
+                    if mode in ['displayinfo2','pseudo1105','retina']:
+                        body=struct.pack('!HHHHHIIH',1,2,2,dimensions,dimensions,0,0,0)
+                        if mode in ['displayinfo2','retina']: c.sendall(b'\x51'+struct.pack('!H',len(body))+body)
                         else:
                             c.sendall(b'\x00\x00\x00\x01'+struct.pack('!HHHHi',0,0,2,2,1105)+struct.pack('!H',len(body))+body)
                     if mode == 'zero-display':
@@ -99,37 +106,54 @@ def fixture(listener, mode, events, errors):
                     receive(c,9)
                     if sent_frame: continue
                     sent_frame = True
-                    packet=b'\x00\x00\x00\x01'+struct.pack('!HHHHi',0,0,2,2,0)+PIXELS
+                    if mode == 'partial':
+                        # Deliberately leave three pixels uninitialized. The harness
+                        # must observe sequence zero before requesting the rest.
+                        packet=b'\x00\x00\x00\x01'+struct.pack('!HHHHi',0,0,1,1,0)+PIXELS[:4]
+                    else:
+                        pixels = PIXELS * 4 if mode == 'retina' else PIXELS
+                        packet=b'\x00\x00\x00\x01'+struct.pack('!HHHHi',0,0,dimensions,dimensions,0)+pixels
                     # Deliberately split rectangle headers/pixels across writes.
                     for i in range(0,len(packet),3): c.sendall(packet[i:i+3])
                 elif kind == 9:
                     subscription=receive(c,15)
                     assert subscription[1:3] == b'\x00\x01'
-                    assert subscription[-4:] == b'\x00\x02\x00\x02'
+                    assert subscription[-4:] == struct.pack('!HH',dimensions,dimensions)
                 elif kind == 16:
                     payload=receive(c,17)
                     assert payload[0] == 0
                     decrypted=subprocess.run(['/usr/bin/openssl','enc','-d','-aes-128-ecb','-nopad','-K',event_key],
                                              input=payload[1:],capture_output=True,check=True).stdout
-                    assert decrypted[0] == 0xff and decrypted[1] in (0,1)
-                    assert decrypted[2:6] == b'\x00\x00\x00\x61'
-                    events.append(('key',decrypted))
+                    if decrypted[0] == 0xff:
+                        assert decrypted[1] in (0,1)
+                        assert struct.unpack('!I',decrypted[2:6])[0] in [0x61,0xffe1,0xffe7,0xffe8,0xffe9,0xffea]
+                        timestamp=struct.unpack('!I',decrypted[6:10])[0]
+                        # Connection-relative monotonic microseconds, never truncated
+                        # wall-clock time (which macOS silently drops for literal text).
+                        assert 0 < timestamp <= (time.monotonic()-started)*1_000_000+100_000, timestamp
+                        assert decrypted[10:] == bytes(6)
+                        events.append(('key',decrypted))
+                    elif decrypted[10] == 0xff:
+                        assert encrypted_pointer, 'Default pointer unexpectedly changed wire format'
+                        assert decrypted[:10] == bytes(10)
+                        assert decrypted[11] in (0,1,2,3,4,8,16)
+                        if mode == 'partial' and not partial_complete and decrypted[11:] == bytes(5):
+                            # The marker is sent only after the C harness proves
+                            # partial pixels have not been published as a frame.
+                            partial_complete = True
+                            packet=(b'\x00\x00\x00\x02'+struct.pack('!HHHHi',1,0,1,1,0)+PIXELS[4:8]+
+                                    struct.pack('!HHHHi',0,1,2,1,0)+PIXELS[8:])
+                            c.sendall(packet)
+                        else:
+                            assert decrypted[12:] == struct.pack('!HH',dimensions//2,dimensions//2)
+                            events.append(('pointer',decrypted[11:]))
+                    else: raise AssertionError('Unrecognized encrypted input event')
                 elif kind == 23:
-                    header=receive(c,3)
-                    length=struct.unpack('!H',header[1:])[0]
-                    body=receive(c,length)
-                    assert (length,struct.unpack('!HH',body[:4])) in [(32,(2,8)),(54,(1,11))]
-                    assert body[-4:] == b'\x00\x01\x00\x01'
-                    if length == 32:
-                        line_x,line_y=struct.unpack('!ff',body[4:12])
-                        assert abs(line_x+80/45) < 0.001 and abs(line_y-160/45) < 0.001
-                    else:
-                        assert struct.unpack('!ii',body[22:30]) == (-80,160)
-                    events.append(('scroll',body))
+                    raise AssertionError('Unreliable Apple gesture events must not be emitted')
                 elif kind == 4:
                     raise AssertionError('Plaintext keyboard event is forbidden in enhanced ARD mode')
                 elif kind == 5:
-                    events.append(('pointer',receive(c,5)))
+                    raise AssertionError('Plaintext pointer event is forbidden in enhanced ARD mode')
                 else: raise AssertionError(f'unexpected client message {kind}')
     except Exception as exc: errors.append(exc)
     finally: listener.close()
@@ -143,21 +167,43 @@ int main(int argc, char **argv) {
     TMVNC *c=tm_vnc_create("127.0.0.1",atoi(argv[1]),"fixture-agent","fixture-password");
     if (!c) return 10;
     int connected=tm_vnc_connect(c);
-    if (strcmp(argv[2],"success") && strcmp(argv[2],"pending") && strcmp(argv[2],"zero-display") && strcmp(argv[2],"displayinfo2") && strcmp(argv[2],"pseudo1105")) {
+    if (strcmp(argv[2],"success") && strcmp(argv[2],"pending") && strcmp(argv[2],"zero-display") && strcmp(argv[2],"displayinfo2") && strcmp(argv[2],"pseudo1105") && strcmp(argv[2],"partial") && strcmp(argv[2],"retina") && strcmp(argv[2],"encrypted-pointer") && strcmp(argv[2],"encrypted-retina")) {
         if (connected) return 11;
         tm_vnc_destroy(c); return 0;
     }
     if (!connected) { fprintf(stderr,"%s\n",tm_vnc_error(c)); return 12; }
-    if (tm_vnc_width(c)!=2 || tm_vnc_height(c)!=2) return 13;
+    int dimensions = strstr(argv[2],"retina") ? 4 : 2;
+    if (tm_vnc_width(c)!=dimensions || tm_vnc_height(c)!=dimensions) return 13;
     if (!tm_vnc_request_frame(c)) return 14;
-    const unsigned char expected[]={0,0,255,0,0,255,0,0,255,0,0,0,255,255,255,0};
-    for (int i=0;i<40 && (!tm_vnc_sequence(c) || memcmp(tm_vnc_pixels(c),expected,16));i++)
+    const unsigned char pattern[]={0,0,255,0,0,255,0,0,255,0,0,0,255,255,255,0};
+    unsigned char expected[64];
+    for (int i=0;i<4;i++) memcpy(expected+i*16,pattern,16);
+    if (!strcmp(argv[2],"partial")) {
+        for (int i=0;i<40 && tm_vnc_pixels(c)[2]!=255;i++)
+          if (tm_vnc_poll(c,100)<0) return 21;
+        if (tm_vnc_pixels(c)[2]!=255 || tm_vnc_sequence(c)!=0) return 22;
+        for (int i=4;i<16;i++) if (tm_vnc_pixels(c)[i]!=0) return 23;
+        if (!tm_vnc_pointer(c,0,0,0)) return 24; /* unlock remaining fixture tiles */
+    }
+    for (int i=0;i<40 && (!tm_vnc_sequence(c) || memcmp(tm_vnc_pixels(c),expected,dimensions*dimensions*4));i++)
       if (tm_vnc_poll(c,100)<0) return 15;
-    if (!tm_vnc_sequence(c) || memcmp(tm_vnc_pixels(c),expected,16)) return 16;
+    if (!tm_vnc_sequence(c) || memcmp(tm_vnc_pixels(c),expected,dimensions*dimensions*4)) return 16;
     if (!tm_vnc_key(c,0x61,1) || !tm_vnc_key(c,0x61,0)) return 17;
-    if (!tm_vnc_pointer(c,1,1,1) || !tm_vnc_pointer(c,1,1,0)) return 18;
-    if (!tm_vnc_pointer(c,1,1,4) || !tm_vnc_pointer(c,1,1,0)) return 19;
-    if (!tm_vnc_scroll(c,1,1,80,-160)) return 20;
+    const unsigned int modifiers[]={0xffe7,0xffe9,0xffe8,0xffea};
+    for (int i=0;i<4;i++)
+      if (!tm_vnc_key(c,modifiers[i],1) || !tm_vnc_key(c,modifiers[i],0)) return 25;
+    int coordinate = dimensions/2;
+    if (!tm_vnc_pointer(c,coordinate,coordinate,1) || !tm_vnc_pointer(c,coordinate,coordinate,0)) return 18;
+    if (!tm_vnc_pointer(c,coordinate,coordinate,4) || !tm_vnc_pointer(c,coordinate,coordinate,0)) return 19;
+    if (strstr(argv[2],"encrypted-")) {
+        /* Exercise middle and simultaneous left+right button normalization. */
+        if (!tm_vnc_pointer(c,coordinate,coordinate,2) || !tm_vnc_pointer(c,coordinate,coordinate,0)) return 26;
+        if (!tm_vnc_pointer(c,coordinate,coordinate,5) || !tm_vnc_pointer(c,coordinate,coordinate,0)) return 27;
+    }
+    if (tm_vnc_scroll(c,coordinate,coordinate,3,-5)) return 30;
+    if (!tm_vnc_scroll(c,coordinate,coordinate,0,-5)) return 20;
+    if (tm_vnc_scroll(c,coordinate,coordinate,1001,0)) return 28;
+    if (tm_vnc_scroll(c,dimensions,coordinate,0,-80)) return 29;
     tm_vnc_destroy(c); return 0;
 }
 '''
@@ -171,19 +217,35 @@ def main():
         subprocess.run(['clang','-Wall','-Wextra','-Wno-unused-parameter',
                         '-I'+str(ROOT/'Sources/CVNCBridge/include'),*['-I'+str(p) for p in include_paths],
                         str(source),str(ROOT/'Sources/CVNCBridge/bridge.c'),'-o',str(binary)],check=True)
-        for mode in ['plain-rfb','no-auth','reject','console-only','virtual-denied','success','pending','zero-display','displayinfo2','pseudo1105']:
+        for mode in ['plain-rfb','no-auth','reject','console-only','virtual-denied'] + SUCCESS_MODES:
             listener=socket.socket(); listener.bind(('127.0.0.1',0)); listener.listen(1)
             events=[]; errors=[]
             worker=threading.Thread(target=fixture,args=(listener,mode,events,errors),daemon=True); worker.start()
-            result=subprocess.run([str(binary),str(listener.getsockname()[1]),mode],capture_output=True,text=True,timeout=15)
+            environment=dict(os.environ)
+            environment.pop('TERMINAL_MAC_VNC_KEY_DELAY_MS',None)
+            environment.pop('TERMINAL_MAC_VNC_POINTER_ENCRYPTED',None)
+            result=subprocess.run([str(binary),str(listener.getsockname()[1]),mode],capture_output=True,text=True,timeout=15,env=environment)
             worker.join(9)
             assert result.returncode == 0, (mode,result.returncode,result.stderr)
             assert not worker.is_alive(), (mode,'fixture did not finish')
             assert not errors, (mode,errors)
-            if mode in ['success','pending','zero-display','displayinfo2','pseudo1105']:
-                assert [e[0] for e in events] == ['key','key','pointer','pointer','pointer','pointer','scroll','scroll'], events
-                assert [events[0][1][1], events[1][1][1]] == [1,0]
-                assert events[2][1] == b'\x01\x00\x01\x00\x01',events
-                assert events[4][1] == b'\x02\x00\x01\x00\x01',events
+            if mode in SUCCESS_MODES:
+                pointer_count = 8 if mode.startswith('encrypted-') else 4
+                vertical_ticks = 3 if mode in ['retina','encrypted-retina'] else 5
+                assert [e[0] for e in events] == ['key']*10 + ['pointer']*(pointer_count+vertical_ticks*2), events
+                assert [event[1][1] for event in events[:10]] == [1,0]*5
+                timestamps=[struct.unpack('!I',event[1][6:10])[0] for event in events if event[0] == 'key']
+                assert timestamps == sorted(timestamps), timestamps
+                assert all(timestamps[i+1]-timestamps[i] >= 15_000 for i in range(0,len(timestamps),2)), timestamps
+                assert [struct.unpack('!I',event[1][2:6])[0] for event in events[:10]] == [0x61]*2+[0xffe9]*2+[0xffe7]*2+[0xffea]*2+[0xffe8]*2
+                coordinate = 2 if mode in ['retina','encrypted-retina'] else 1
+                assert events[10][1] == b'\x01'+struct.pack('!HH',coordinate,coordinate),events
+                assert events[12][1] == b'\x02'+struct.pack('!HH',coordinate,coordinate),events
+                if mode.startswith('encrypted-'):
+                    assert events[14][1] == b'\x04'+struct.pack('!HH',coordinate,coordinate),events
+                    assert events[16][1] == b'\x03'+struct.pack('!HH',coordinate,coordinate),events
+                wheel_start = 10 + pointer_count
+                position=struct.pack('!HH',coordinate,coordinate)
+                assert [event[1] for event in events[wheel_start:]] == [bytes([mask])+position for mask in [16,0]*vertical_ticks], events
             print('PASS:',mode)
 if __name__ == '__main__': main()

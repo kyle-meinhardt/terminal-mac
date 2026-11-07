@@ -172,7 +172,7 @@ final class TerminalViewer {
                 // Check back quickly while waiting for a login, so the desktop appears right after it.
                 let request = Request(action: "screenshot", arguments: ["format": "bgra-lz4", "since": String(since), "wait": "500",
                                                                       "maxWidth": String(target?.imageWidth ?? 1280), "maxHeight": String(target?.imageHeight ?? 800)],
-                                      timeout: link == .login ? 2 : 6)
+                                      timeout: mailbox.isVirtualMachine ? (link == .login ? 2 : 6) : 20)
                 defer { mailbox.remove("image-\(request.id.uuidString).bin"); mailbox.remove("image-\(request.id.uuidString).png") }
                 do {
                     let reply = try await mailbox.call(request)
@@ -185,6 +185,7 @@ final class TerminalViewer {
                        (1...16384).contains(w), (1...16384).contains(h), (w, h) != points {
                         points = (w, h); forceRelayout()
                     }
+                    if let sequence = Int(v["sequence"] ?? "") { since = sequence }
                     if v["unchanged"] == "true" { if link != .live { link = .live }; continue }
                     guard let name = v["image"], [".bin", ".png"].contains(where: { name == "image-\(request.id.uuidString)\($0)" }),
                           let data = try mailbox.read(name, limit: 64 * 1024 * 1024) else { throw Failure("Invalid frame from the guest helper") }

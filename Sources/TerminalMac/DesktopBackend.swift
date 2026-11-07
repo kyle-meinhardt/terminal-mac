@@ -35,7 +35,8 @@ final class VNCDesktopBackend: DesktopBackend {
 
     convenience init(profile: SessionProfile, password: String, profiles: SessionProfiles = SessionProfiles(store: Store())) throws {
         try self.init(profile: profile, profiles: profiles,
-                      connection: VNCConnection(host: profile.host, port: profile.port, username: profile.username, password: password))
+                      connection: VNCConnection(host: profile.host, port: profile.port, username: profile.username, password: password,
+                                                inputAuthorization: { try profiles.requireInputApproval(for: profile) }))
     }
 
     init(profile: SessionProfile, profiles: SessionProfiles, connection: any SessionConnection) {

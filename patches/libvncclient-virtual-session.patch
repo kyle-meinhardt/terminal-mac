@@ -1,5 +1,5 @@
 diff --git a/src/libvncclient/rfbclient.c b/src/libvncclient/rfbclient.c
-index 9c2f349..583b471 100644
+index 9c2f349..1993b42 100644
 --- a/src/libvncclient/rfbclient.c
 +++ b/src/libvncclient/rfbclient.c
 @@ -803,6 +803,8 @@ HandleMSLogonAuth(rfbClient *client)
@@ -19,7 +19,7 @@ index 9c2f349..583b471 100644
    result = TRUE;
  
   out:
-@@ -956,6 +959,115 @@ SetClientAuthSchemes(rfbClient* client,const uint32_t *authSchemes, int size)
+@@ -956,6 +959,190 @@ SetClientAuthSchemes(rfbClient* client,const uint32_t *authSchemes, int size)
    }
  }
  
@@ -28,8 +28,79 @@ index 9c2f349..583b471 100644
 + * This library is deliberately restricted to Apple's separately selected user
 + * desktop. A plain RFB server or a console-only grant fails closed.
 + */
-+static char terminalMacSessionTag, terminalMacMessageTag, terminalMacEncodingTag, terminalMacKeyTag;
++static char terminalMacSessionTag, terminalMacMessageTag, terminalMacEncodingTag, terminalMacKeyTag, terminalMacCoverageTag, terminalMacClockOriginTag, terminalMacPointerMaskTag, terminalMacWheelPointSizeTag, terminalMacWheelPixelSizeTag;
++struct tm_coverage {
++  unsigned char *bits;
++  size_t count, total;
++  int width, height, complete;
++};
++static void tm_reset_coverage(rfbClient *client)
++{
++  struct tm_coverage *coverage = rfbClientGetClientData(client, &terminalMacCoverageTag);
++  if (coverage) { free(coverage->bits); free(coverage); }
++  rfbClientSetClientData(client, &terminalMacCoverageTag, NULL);
++}
++/* Return 1 only once every framebuffer pixel has actually been decoded since
++ * allocation/resize. Apple may send a notification tile well before the rest
++ * of the desktop, so a timer cannot establish first-frame completeness. */
++static int tm_mark_frame(rfbClient *client, int x, int y, int width, int height)
++{
++  struct tm_coverage *coverage = rfbClientGetClientData(client, &terminalMacCoverageTag);
++  int row;
++  if (!coverage) {
++    size_t total;
++    if (client->width <= 0 || client->height <= 0 || client->width > 8192 || client->height > 8192) return -1;
++    total = (size_t)client->width * client->height;
++    if (total > 16777216) return -1;
++    coverage = calloc(1, sizeof(*coverage));
++    if (!coverage) return -1;
++    coverage->bits = calloc((total + 7) / 8, 1);
++    if (!coverage->bits) { free(coverage); return -1; }
++    coverage->width = client->width; coverage->height = client->height; coverage->total = total;
++    rfbClientSetClientData(client, &terminalMacCoverageTag, coverage);
++  }
++  if (coverage->complete) return 1;
++  if (x < 0 || y < 0 || width < 0 || height < 0 || x > coverage->width - width || y > coverage->height - height) return -1;
++  for (row = y; row < y + height; row++) {
++    size_t start = (size_t)row * coverage->width + x, left = width;
++    while (left) {
++      unsigned int offset = start & 7, take = 8 - offset;
++      unsigned char mask, old;
++      if (take > left) take = left;
++      mask = (unsigned char)(((1U << take) - 1) << offset);
++      old = coverage->bits[start >> 3];
++      coverage->count += __builtin_popcount((unsigned int)(mask & ~old));
++      coverage->bits[start >> 3] = old | mask;
++      start += take; left -= take;
++    }
++  }
++  {
++    const char *diagnostics = getenv("TERMINAL_MAC_VNC_DIAGNOSTICS");
++    if (diagnostics && strcmp(diagnostics, "1") == 0)
++      fprintf(stderr, "terminal-mac coverage=%zu/%zu rect=%d,%d,%d,%d encoding=%u\n", coverage->count, coverage->total, x, y, width, height,
++              (uint32_t)((uintptr_t)rfbClientGetClientData(client, &terminalMacEncodingTag) - 1));
++  }
++  if (coverage->count == coverage->total) {
++    coverage->complete = 1;
++    free(coverage->bits); coverage->bits = NULL;
++  }
++  return coverage->complete;
++}
 +int terminal_mac_session_api_version(void) { return 2; }
++static uint64_t tm_monotonic_microseconds(void)
++{
++  struct timespec now;
++  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
++  return (uint64_t)now.tv_sec * 1000000 + now.tv_nsec / 1000;
++}
++/* Numeric-only thread-local handshake diagnostics survive rfbInitClient cleanup.
++ * 1 version, 2 security, 3 ARD authentication, 4 ServerInit, 5 virtual selection,
++ * 6 session setup, 7 handshake complete. No credentials or server strings. */
++static __thread uint32_t tm_stage, tm_flags, tm_allowed, tm_status;
++uint32_t terminal_mac_last_stage(void) { return tm_stage; }
++uint32_t terminal_mac_last_flags(void) { return tm_flags; }
++uint32_t terminal_mac_last_allowed(void) { return tm_allowed; }
++uint32_t terminal_mac_last_status(void) { return tm_status; }
 +static rfbBool tm_store_auth_key(rfbClient *client, const unsigned char *key)
 +{
 +  unsigned char *copy = malloc(16);
@@ -40,6 +111,7 @@ index 9c2f349..583b471 100644
 +}
 +void terminal_mac_clear_session(rfbClient *client)
 +{
++  tm_reset_coverage(client);
 +  unsigned char *key = rfbClientGetClientData(client, &terminalMacKeyTag);
 +  if (key) {
 +    volatile unsigned char *wipe = key;
@@ -79,9 +151,11 @@ index 9c2f349..583b471 100644
 +  uint32_t flags;
 +  if (client->si.nameLength < 22 || name[0] != 0) return FALSE;
 +  flags = tm_u32(name + 2);
++  tm_flags = flags;
 +  if (!(flags & 4) || (flags & 8)) return FALSE;
 +  if (!tm_read_session_body(client, body, sizeof(body), &length) || length < 10 || tm_u16(body) != 1) return FALSE;
-+  if (!(tm_u32(body + 2) & (1U << 2))) return FALSE;
++  tm_allowed = tm_u32(body + 2);
++  if (!(tm_allowed & (1U << 2))) return FALSE;
 +  userLength = length - 10;
 +  if (userLength > 64) return FALSE;
 +  /* Body size 72, version 1, command 2 (virtual desktop), console username. */
@@ -93,6 +167,7 @@ index 9c2f349..583b471 100644
 +    uint32_t status;
 +    if (!tm_read_session_body(client, body, sizeof(body), &length) || tm_u16(body) != 1) return FALSE;
 +    status = tm_u32(body + 2);
++    tm_status = status;
 +    if (status == 0 || status == 4) {
 +      rfbClientSetClientData(client, &terminalMacSessionTag, &terminalMacSessionTag);
 +      return TRUE;
@@ -135,7 +210,16 @@ index 9c2f349..583b471 100644
  /*
   * InitialiseRFBConnection.
   */
-@@ -987,6 +1099,8 @@ InitialiseRFBConnection(rfbClient* client)
+@@ -975,6 +1162,8 @@ InitialiseRFBConnection(rfbClient* client)
+   if (client->listenSpecified)
+     errorMessageOnReadFailure = FALSE;
+ 
++  tm_stage = 1; tm_flags = tm_allowed = tm_status = UINT32_MAX;
++  rfbClientSetClientData(client, &terminalMacClockOriginTag, (void *)(uintptr_t)tm_monotonic_microseconds());
+   if (!ReadFromRFBServer(client, pv, sz_rfbProtocolVersionMsg)) return FALSE;
+ 
+   errorMessageOnReadFailure = TRUE;
+@@ -987,6 +1176,8 @@ InitialiseRFBConnection(rfbClient* client)
    }
  
  
@@ -144,7 +228,7 @@ index 9c2f349..583b471 100644
    DefaultSupportedMessages(client);
    client->major = major;
    client->minor = minor;
-@@ -1028,6 +1142,7 @@ InitialiseRFBConnection(rfbClient* client)
+@@ -1028,11 +1219,13 @@ InitialiseRFBConnection(rfbClient* client)
    rfbClientLog("VNC server supports protocol version %d.%d (viewer %d.%d)\n",
  	  major, minor, rfbProtocolMajorVersion, rfbProtocolMinorVersion);
  
@@ -152,7 +236,13 @@ index 9c2f349..583b471 100644
    sprintf(pv,rfbProtocolVersionFormat,client->major,client->minor);
  
    if (!WriteToRFBServer(client, pv, sz_rfbProtocolVersionMsg)) return FALSE;
-@@ -1046,6 +1161,7 @@ InitialiseRFBConnection(rfbClient* client)
+ 
+ 
++  tm_stage = 2;
+   /* 3.7 and onwards sends a # of security types first */
+   if (client->major==3 && client->minor > 6)
+   {
+@@ -1046,6 +1239,7 @@ InitialiseRFBConnection(rfbClient* client)
    
    rfbClientLog("Selected Security Scheme %d\n", authScheme);
    client->authScheme = authScheme;
@@ -160,25 +250,38 @@ index 9c2f349..583b471 100644
    
    switch (authScheme) {
  
-@@ -1199,7 +1315,7 @@ InitialiseRFBConnection(rfbClient* client)
+@@ -1081,6 +1275,7 @@ InitialiseRFBConnection(rfbClient* client)
+     break;
+ 
+   case rfbARD:
++    tm_stage = 3;
+     if (!HandleARDAuth(client)) return FALSE;
+     break;
+ 
+@@ -1199,7 +1394,8 @@ InitialiseRFBConnection(rfbClient* client)
      return FALSE;
    }
  
 -  ci.shared = (client->appData.shareDesktop ? 1 : 0);
++  tm_stage = 4;
 +  ci.shared = 0xc1; /* Apple Shared + Select + Enhanced; no console fallback. */
  
    if (!WriteToRFBServer(client,  (char *)&ci, sz_rfbClientInitMsg)) return FALSE;
  
-@@ -1228,6 +1344,8 @@ InitialiseRFBConnection(rfbClient* client)
+@@ -1228,6 +1424,12 @@ InitialiseRFBConnection(rfbClient* client)
  
    client->desktopName[client->si.nameLength] = 0;
  
-+  if (!tm_select_virtual_session(client) || !tm_session_setup(client)) return FALSE;
++  tm_stage = 5;
++  if (!tm_select_virtual_session(client)) return FALSE;
++  tm_stage = 6;
++  if (!tm_session_setup(client)) return FALSE;
++  tm_stage = 7;
 +
    rfbClientLog("Desktop name \"%s\"\n",client->desktopName);
  
    rfbClientLog("Connected to VNC server, using protocol version %d.%d\n",
-@@ -1421,6 +1539,12 @@ SetFormatAndEncodings(rfbClient* client)
+@@ -1421,6 +1623,12 @@ SetFormatAndEncodings(rfbClient* client)
    if (se->nEncodings < MAX_ENCODINGS)
      encs[se->nEncodings++] = rfbClientSwap32IfLE(rfbEncodingKeyboardLedState);
  
@@ -191,7 +294,7 @@ index 9c2f349..583b471 100644
    /* New Frame Buffer Size */
    if (se->nEncodings < MAX_ENCODINGS && client->canHandleNewFBSize)
      encs[se->nEncodings++] = rfbClientSwap32IfLE(rfbEncodingNewFBSize);
-@@ -1494,6 +1618,8 @@ SendFramebufferUpdateRequest(rfbClient* client, int x, int y, int w, int h, rfbB
+@@ -1494,6 +1702,8 @@ SendFramebufferUpdateRequest(rfbClient* client, int x, int y, int w, int h, rfbB
  {
    rfbFramebufferUpdateRequestMsg fur;
  
@@ -200,7 +303,7 @@ index 9c2f349..583b471 100644
    if (!SupportsClient2Server(client, rfbFramebufferUpdateRequest)) return TRUE;
  
    if (client->requestedResize) {
-@@ -1511,6 +1637,8 @@ SendFramebufferUpdateRequest(rfbClient* client, int x, int y, int w, int h, rfbB
+@@ -1511,6 +1721,8 @@ SendFramebufferUpdateRequest(rfbClient* client, int x, int y, int w, int h, rfbB
    if (!WriteToRFBServer(client, (char *)&fur, sz_rfbFramebufferUpdateRequestMsg))
      return FALSE;
  
@@ -209,51 +312,112 @@ index 9c2f349..583b471 100644
    return TRUE;
  }
  
-@@ -1665,7 +1793,8 @@ SendPointerEvent(rfbClient* client,int x, int y, int buttonMask)
-   if (!SupportsClient2Server(client, rfbPointerEvent)) return TRUE;
- 
-   pe.type = rfbPointerEvent;
--  pe.buttonMask = buttonMask;
-+  /* Enhanced ARD swaps the standard RFB middle/right button bits. */
-+  pe.buttonMask = (buttonMask & ~6) | ((buttonMask & 2) << 1) | ((buttonMask & 4) >> 1);
-   if (x < 0) x = 0;
-   if (y < 0) y = 0;
- 
-@@ -1675,6 +1804,33 @@ SendPointerEvent(rfbClient* client,int x, int y, int buttonMask)
+@@ -1653,6 +1865,25 @@ rfbBool SendXvpMsg(rfbClient* client, uint8_t version, uint8_t code)
  }
  
  
-+/* Apple GestureEvent pair: compact floating-point lines, then detailed wheel.
-+ * CLI deltas follow CGEvent: negative Y scrolls down; ARD wire points use the opposite sign.
-+ */
-+static void tm_put16(unsigned char *p, uint16_t value) { p[0] = value >> 8; p[1] = value; }
-+static void tm_put32(unsigned char *p, uint32_t value) { p[0] = value >> 24; p[1] = value >> 16; p[2] = value >> 8; p[3] = value; }
-+static int32_t tm_round(double value) { return (int32_t)(value < 0 ? value - 0.5 : value + 0.5); }
-+rfbBool terminal_mac_scroll(rfbClient *client, int x, int y, int dx, int dy)
++static rfbBool tm_pointer_delay(rfbClient *client, int mask, rfbBool sent)
 +{
-+  unsigned char compact[36] = {23, 0, 0, 32, 0, 2, 0, 8};
-+  unsigned char detailed[58] = {23, 0, 0, 54, 0, 1, 0, 11};
-+  float lineX = -(float)dx / 45.0f, lineY = -(float)dy / 45.0f;
-+  uint32_t bits;
-+  int lineStepX = dx == 0 ? 0 : (lineX > 0 ? (tm_round(lineX) > 0 ? tm_round(lineX) : 1) : (tm_round(lineX) < 0 ? tm_round(lineX) : -1));
-+  int lineStepY = dy == 0 ? 0 : (lineY > 0 ? (tm_round(lineY) > 0 ? tm_round(lineY) : 1) : (tm_round(lineY) < 0 ? tm_round(lineY) : -1));
-+  if (!terminal_mac_virtual_session(client) || x < 0 || y < 0 || x >= client->width || y >= client->height || dx < -1000 || dx > 1000 || dy < -1000 || dy > 1000) return FALSE;
-+  memcpy(&bits, &lineX, 4); tm_put32(compact + 8, bits);
-+  memcpy(&bits, &lineY, 4); tm_put32(compact + 12, bits);
-+  tm_put32(compact + 20, 1);
-+  tm_put16(compact + 32, x); tm_put16(compact + 34, y);
-+  tm_put16(detailed + 8, (uint16_t)lineStepX); tm_put16(detailed + 10, (uint16_t)lineStepY);
-+  tm_put32(detailed + 14, (uint32_t)tm_round((double)lineX * 65536));
-+  tm_put32(detailed + 18, (uint32_t)tm_round((double)lineY * 65536));
-+  tm_put32(detailed + 26, (uint32_t)-dx); tm_put32(detailed + 30, (uint32_t)-dy);
-+  tm_put16(detailed + 54, x); tm_put16(detailed + 56, y);
-+  return WriteToRFBServer(client, (char *)compact, sizeof(compact)) && WriteToRFBServer(client, (char *)detailed, sizeof(detailed));
++  int previous = (int)(uintptr_t)rfbClientGetClientData(client, &terminalMacPointerMaskTag);
++  if (sent) {
++    rfbClientSetClientData(client, &terminalMacPointerMaskTag, (void *)(uintptr_t)mask);
++    if ((mask & ~previous & 7) != 0) {
++      long milliseconds = 20;
++      const char *setting = getenv("TERMINAL_MAC_VNC_POINTER_DELAY_MS");
++      if (setting) {
++        char *end;
++        long configured = strtol(setting, &end, 10);
++        if (*setting && !*end && configured >= 0 && configured <= 100) milliseconds = configured;
++      }
++      if (milliseconds > 0) usleep(milliseconds * 1000);
++    }
++  }
++  return sent;
 +}
 +
  /*
-  * Resize client
+  * SendPointerEvent.
   */
-@@ -1694,6 +1850,33 @@ ResizeClientBuffer(rfbClient* client, int width, int height)
+@@ -1660,20 +1891,62 @@ rfbBool SendXvpMsg(rfbClient* client, uint8_t version, uint8_t code)
+ rfbBool
+ SendPointerEvent(rfbClient* client,int x, int y, int buttonMask)
+ {
+-  rfbPointerEventMsg pe;
+-
+-  if (!SupportsClient2Server(client, rfbPointerEvent)) return TRUE;
++  unsigned char payload[16] = {0}, wire[18] = {16, 0};
++  unsigned char *authKey = rfbClientGetClientData(client, &terminalMacKeyTag);
++  int encryptedLength = 0;
++  int mask = (buttonMask & ~6) | ((buttonMask & 2) << 1) | ((buttonMask & 4) >> 1);
++  const char *diagnostics = getenv("TERMINAL_MAC_VNC_DIAGNOSTICS");
++  if (!terminal_mac_virtual_session(client) || !authKey || buttonMask < 0 || buttonMask > 127 || x < 0 || y < 0 || x >= client->width || y >= client->height) return FALSE;
++  /* Apple's alternate-user session routes pointer input through its encrypted
++     event handler, in framebuffer pixels. Plain RFB pointer input is ignored. */
++  payload[10] = 255; payload[11] = mask;
++  payload[12] = x >> 8; payload[13] = x;
++  payload[14] = y >> 8; payload[15] = y;
++  if (diagnostics && strcmp(diagnostics, "1") == 0) fprintf(stderr, "terminal-mac pointer pixels=%d,%d mask=%d\n", x, y, mask);
++  if (!encrypt_aes128ecb(wire + 2, &encryptedLength, authKey, payload, sizeof(payload)) || encryptedLength != 16) return FALSE;
++  return tm_pointer_delay(client, mask, WriteToRFBServer(client, (char *)wire, sizeof(wire)));
++}
+ 
+-  pe.type = rfbPointerEvent;
+-  pe.buttonMask = buttonMask;
+-  if (x < 0) x = 0;
+-  if (y < 0) y = 0;
+ 
+-  pe.x = rfbClientSwap16IfLE(x);
+-  pe.y = rfbClientSwap16IfLE(y);
+-  return WriteToRFBServer(client, (char *)&pe, sz_rfbPointerEventMsg);
++/* Each Apple wheel pulse advances one logical point. Keep target positions
++ * in raw framebuffer pixels, converting only the requested scroll distance
++ * through DisplayInfo2's backing ratio (one pulse per pixel if absent). */
++static int tm_wheel_count(rfbClient *client, int amount, int vertical)
++{
++  uint32_t points = (uint32_t)(uintptr_t)rfbClientGetClientData(client, &terminalMacWheelPointSizeTag);
++  uint32_t pixels = (uint32_t)(uintptr_t)rfbClientGetClientData(client, &terminalMacWheelPixelSizeTag);
++  unsigned int logical = vertical ? points & 65535 : points >> 16;
++  unsigned int physical = vertical ? pixels & 65535 : pixels >> 16;
++  unsigned int distance = abs(amount);
++  if (!logical || !physical) return distance;
++  return (distance * logical + physical - 1) / physical;
++}
++static rfbBool tm_wheel_drain(rfbClient *client)
++{
++  unsigned int message;
++  uint64_t until = tm_monotonic_microseconds() + 10000;
++  for (message = 0; message < 32; message++) {
++    int ready = WaitForMessage(client, 0);
++    if (ready < 0 || (ready > 0 && !HandleRFBServerMessage(client))) return FALSE;
++    if (!ready || tm_monotonic_microseconds() >= until) break;
++  }
++  return TRUE;
++}
++static rfbBool tm_wheel_ticks(rfbClient *client, int x, int y, int amount, int vertical)
++{
++  int tick, count = tm_wheel_count(client, amount, vertical);
++  int mask = amount < 0 ? 16 : 8;
++  for (tick = 0; tick < count; tick++) {
++    if (!SendPointerEvent(client, x, y, mask) || !SendPointerEvent(client, x, y, 0)) return FALSE;
++    if ((tick + 1) % 32 == 0 && !tm_wheel_drain(client)) return FALSE;
++  }
++  return TRUE;
++}
++rfbBool terminal_mac_scroll(rfbClient *client, int x, int y, int dx, int dy)
++{
++  if (!terminal_mac_virtual_session(client) || x < 0 || y < 0 || x >= client->width || y >= client->height || dx != 0 || dy < -1000 || dy > 1000) return FALSE;
++  return dy == 0 || tm_wheel_ticks(client, x, y, dy, 1);
+ }
+-
+ 
+ /*
+  * Resize client
+@@ -1690,10 +1963,48 @@ ResizeClientBuffer(rfbClient* client, int width, int height)
+       client->updateRect.w = client->width;
+       client->updateRect.h = client->height;
+   }
++  tm_reset_coverage(client);
+   return client->MallocFrameBuffer(client);
  }
  
  
@@ -273,6 +437,16 @@ index 9c2f349..583b471 100644
 +  if (!ReadFromRFBServer(client, (char *)payload, length)) goto done;
 +  count = tm_u16(payload + 18);
 +  if (count > 64 || length < 20 + count * 56) goto done;
++  {
++    uint32_t pointWidth = tm_u16(payload + 2), pointHeight = tm_u16(payload + 4);
++    uint32_t pixelWidth = tm_u16(payload + 6), pixelHeight = tm_u16(payload + 8);
++    const char *diagnostics = getenv("TERMINAL_MAC_VNC_DIAGNOSTICS");
++    if (diagnostics && strcmp(diagnostics, "1") == 0) fprintf(stderr, "terminal-mac display points=%u,%u pixels=%u,%u rectangle=%d,%d\n", pointWidth, pointHeight, pixelWidth, pixelHeight, rectangleWidth, rectangleHeight);
++    if (pointWidth && pointHeight && pointWidth <= pixelWidth && pointHeight <= pixelHeight && pixelWidth <= 8192 && pixelHeight <= 8192) {
++      rfbClientSetClientData(client, &terminalMacWheelPointSizeTag, (void *)(uintptr_t)((pointWidth << 16) | pointHeight));
++      rfbClientSetClientData(client, &terminalMacWheelPixelSizeTag, (void *)(uintptr_t)((pixelWidth << 16) | pixelHeight));
++    }
++  }
 +  width = rectangleWidth > 0 ? rectangleWidth : tm_u16(payload + 6);
 +  height = rectangleHeight > 0 ? rectangleHeight : tm_u16(payload + 8);
 +  if (!width || !height || width > 8192 || height > 8192 || (uint64_t)width * height > 16777216) goto done;
@@ -287,29 +461,59 @@ index 9c2f349..583b471 100644
  /*
   * SendExtDesktopSize
   */
-@@ -1742,15 +1925,22 @@ SendExtDesktopSize(rfbClient* client, uint16_t width, uint16_t height)
+@@ -1735,6 +2046,19 @@ SendExtDesktopSize(rfbClient* client, uint16_t width, uint16_t height)
+ }
+ 
+ 
++static rfbBool tm_key_delay(rfbBool down, rfbBool sent)
++{
++  const char *setting = getenv("TERMINAL_MAC_VNC_KEY_DELAY_MS");
++  long milliseconds = 20;
++  if (setting) {
++    char *end;
++    long configured = strtol(setting, &end, 10);
++    if (*setting && !*end && configured >= 0 && configured <= 100) milliseconds = configured;
++  }
++  if (down && sent && milliseconds > 0) usleep(milliseconds * 1000);
++  return sent;
++}
++
+ /*
+  * SendKeyEvent.
+  */
+@@ -1742,15 +2066,32 @@ SendExtDesktopSize(rfbClient* client, uint16_t width, uint16_t height)
  rfbBool
  SendKeyEvent(rfbClient* client, uint32_t key, rfbBool down)
  {
 -  rfbKeyEventMsg ke;
+-
+-  if (!SupportsClient2Server(client, rfbKeyEvent)) return TRUE;
 +  unsigned char payload[16] = {0}, wire[18] = {16, 0};
 +  unsigned char *authKey = rfbClientGetClientData(client, &terminalMacKeyTag);
 +  int encryptedLength = 0;
 +  uint32_t timestamp;
-+  struct timeval now;
 +  if (!terminal_mac_virtual_session(client) || !authKey) return FALSE;
-+  gettimeofday(&now, NULL);
-+  timestamp = (uint32_t)((uint64_t)now.tv_sec * 1000000 + now.tv_usec);
++  /* Apple interprets X11 Alt as Command and Meta as Option. The public
++     terminal-mac API uses Meta for cmd and Alt for option, so swap on wire. */
++  if (key == 0xffe7) key = 0xffe9;
++  else if (key == 0xffe8) key = 0xffea;
++  else if (key == 0xffe9) key = 0xffe7;
++  else if (key == 0xffea) key = 0xffe8;
++  /* AppKit expects a timestamp relative to this connection's monotonic
++     clock. Wall-clock microseconds make hotkeys work but discard text input. */
++  {
++    uint64_t origin = (uint64_t)(uintptr_t)rfbClientGetClientData(client, &terminalMacClockOriginTag);
++    uint64_t current = tm_monotonic_microseconds();
++    timestamp = current >= origin ? (uint32_t)(current - origin) : 0;
++  }
 +  payload[0] = 255; payload[1] = down ? 1 : 0;
 +  payload[2] = key >> 24; payload[3] = key >> 16;
 +  payload[4] = key >> 8; payload[5] = key;
 +  payload[6] = timestamp >> 24; payload[7] = timestamp >> 16;
 +  payload[8] = timestamp >> 8; payload[9] = timestamp;
 +  if (!encrypt_aes128ecb(wire + 2, &encryptedLength, authKey, payload, sizeof(payload)) || encryptedLength != 16) return FALSE;
-+  return WriteToRFBServer(client, (char *)wire, sizeof(wire));
++  return tm_key_delay(down, WriteToRFBServer(client, (char *)wire, sizeof(wire)));
  
--  if (!SupportsClient2Server(client, rfbKeyEvent)) return TRUE;
--
 -  memset(&ke, 0, sizeof(ke));
 -  ke.type = rfbKeyEvent;
 -  ke.down = down ? 1 : 0;
@@ -318,7 +522,7 @@ index 9c2f349..583b471 100644
  }
  
  
-@@ -2051,6 +2241,7 @@ HandleRFBServerMessage(rfbClient* client)
+@@ -2051,6 +2392,7 @@ HandleRFBServerMessage(rfbClient* client)
    if (!ReadFromRFBServer(client, (char *)&msg, 1))
      return FALSE;
  
@@ -326,7 +530,7 @@ index 9c2f349..583b471 100644
    switch (msg.type) {
  
    case rfbSetColourMapEntries:
-@@ -2082,6 +2273,24 @@ HandleRFBServerMessage(rfbClient* client)
+@@ -2082,6 +2424,24 @@ HandleRFBServerMessage(rfbClient* client)
      break;
    }
  
@@ -351,7 +555,7 @@ index 9c2f349..583b471 100644
    case rfbFramebufferUpdate:
    {
      rfbFramebufferUpdateRectHeader rect;
-@@ -2100,6 +2309,7 @@ HandleRFBServerMessage(rfbClient* client)
+@@ -2100,6 +2460,7 @@ HandleRFBServerMessage(rfbClient* client)
  	return FALSE;
  
        rect.encoding = rfbClientSwap32IfLE(rect.encoding);
@@ -359,7 +563,7 @@ index 9c2f349..583b471 100644
        if (rect.encoding == rfbEncodingLastRect)
  	break;
  
-@@ -2109,6 +2319,26 @@ HandleRFBServerMessage(rfbClient* client)
+@@ -2109,6 +2470,26 @@ HandleRFBServerMessage(rfbClient* client)
        rect.r.h = rfbClientSwap16IfLE(rect.r.h);
  
  
@@ -386,7 +590,20 @@ index 9c2f349..583b471 100644
        if (rect.encoding == rfbEncodingXCursor ||
  	  rect.encoding == rfbEncodingRichCursor) {
  
-@@ -2690,6 +2920,7 @@ HandleRFBServerMessage(rfbClient* client)
+@@ -2558,7 +2939,11 @@ HandleRFBServerMessage(rfbClient* client)
+       /* Now we may discard "soft cursor locks". */
+       client->SoftCursorUnlockScreen(client);
+ 
+-      client->GotFrameBufferUpdate(client, rect.r.x, rect.r.y, rect.r.w, rect.r.h);
++      {
++        int frameReady = tm_mark_frame(client, rect.r.x, rect.r.y, rect.r.w, rect.r.h);
++        if (frameReady < 0) return FALSE;
++        if (frameReady) client->GotFrameBufferUpdate(client, rect.r.x, rect.r.y, rect.r.w, rect.r.h);
++      }
+     }
+ 
+     if (!SendIncrementalFramebufferUpdateRequest(client))
+@@ -2690,6 +3075,7 @@ HandleRFBServerMessage(rfbClient* client)
  
    case rfbResizeFrameBuffer:
    {

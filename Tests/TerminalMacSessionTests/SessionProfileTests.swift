@@ -71,4 +71,28 @@ final class SessionProfileTests: XCTestCase {
             XCTAssertThrowsError(try profiles.savePassword(password, name: "agent"))
         }
     }
+
+    func testDeferredInputAuthorizationReadsApprovalAndTargetAtExecution() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let profiles = SessionProfiles(store: Store(root: root))
+        var original = profile(); original.inputApproved = true
+        try profiles.save(original)
+        // A connection retains this callback while Keychain/network setup runs.
+        // Its captured profile identifies the intended target, not live approval.
+        let inputAuthorization: @Sendable () throws -> Void = { [profiles, original] in
+            try profiles.requireInputApproval(for: original)
+        }
+        XCTAssertNoThrow(try inputAuthorization())
+        var changed = original; changed.inputApproved = false
+        try profiles.save(changed)
+        XCTAssertThrowsError(try inputAuthorization(), "Revocation during setup must prevent later input")
+        changed.inputApproved = true; changed.port += 1
+        try profiles.save(changed)
+        XCTAssertThrowsError(try inputAuthorization(), "Approval of a new endpoint must not authorize the old connection")
+        try profiles.save(original)
+        XCTAssertNoThrow(try inputAuthorization())
+        try FileManager.default.removeItem(at: profiles.directory(original.name))
+        XCTAssertThrowsError(try inputAuthorization(), "A deleted profile must fail closed")
+    }
 }

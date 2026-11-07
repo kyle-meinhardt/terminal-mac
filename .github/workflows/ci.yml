@@ -13,8 +13,14 @@ jobs:
       - uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: latest-stable
+      - name: Session build dependencies
+        run: brew install cmake openssl@4
+      - name: Build virtual-session protocol library
+        run: bash scripts/build-session-library.sh
       - name: Test
         run: swift test
+      - name: Session protocol fixtures
+        run: python3 scripts/test-session-rfb.py
       - name: Build (ad-hoc signed)
         run: SIGN_IDENTITY=- bash scripts/build.sh
       - name: Package checks

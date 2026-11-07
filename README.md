@@ -83,14 +83,17 @@ The first download may take time; packaging cannot eliminate downloading and ins
 
 ## Build from source
 
+For this fork's session backend, create a stable local signing identity before saving a session credential:
+
 ```sh
+bash scripts/create-signing-identity.sh 'TerminalMac Session Local'
 bash scripts/build.sh
 ./dist/terminal-mac doctor
 ```
 
 The build creates `dist/TerminalMac.app`, including `TerminalMacGuest.app`, and the `dist/terminal-mac` launcher. Virtualization needs the host executable's `com.apple.security.virtualization` entitlement; use the packaged launcher instead of the unsigned Swift build product.
 
-It is signed with the self-signed "Govijr Code Signing" identity when your keychain has it (`bash scripts/create-signing-identity.sh` makes one), and ad-hoc otherwise. A stable identity keeps the guest helper's permissions across rebuilds; ad-hoc builds need them granted again. [RELEASING.md](RELEASING.md) covers signing and publishing.
+The build prefers the self-signed "TerminalMac Session Local" identity, then "Govijr Code Signing" when available, and signs ad-hoc otherwise. See the [session guide](docs/SESSIONS.md#build) for the initial Keychain prompts and credential setup. A stable identity keeps the guest helper's permissions across rebuilds; ad-hoc builds need them granted again. [RELEASING.md](RELEASING.md) covers signing and publishing.
 
 ## Create your first Mac
 

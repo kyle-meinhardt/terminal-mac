@@ -14,7 +14,8 @@ identity="${SIGN_IDENTITY:-}"
 # A stable identity keeps the guest helper's Screen Recording and Accessibility approvals across
 # updates; ad-hoc signatures change with every build. SIGN_IDENTITY=- forces ad-hoc signing.
 if [[ -z "$identity" ]]; then
-  if security find-identity -p codesigning 2>/dev/null | grep -qF "\"$SIGNING_NAME\""; then identity="$SIGNING_NAME"
+  if security find-identity -p codesigning 2>/dev/null | grep -qF '"TerminalMac Session Local"'; then identity='TerminalMac Session Local'
+  elif security find-identity -p codesigning 2>/dev/null | grep -qF "\"$SIGNING_NAME\""; then identity="$SIGNING_NAME"
   else identity=-; echo "No \"$SIGNING_NAME\" identity; signing ad-hoc. Run scripts/create-signing-identity.sh to keep guest permissions across updates." >&2
   fi
 fi

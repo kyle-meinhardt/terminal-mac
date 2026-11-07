@@ -109,5 +109,11 @@ final class AgentServerTests: XCTestCase {
         XCTAssertTrue(server.serverInstructions.contains("It is not a VM"))
         let screenshot = try XCTUnwrap(server.toolDefinitions.first { $0["name"] as? String == "screenshot" })
         XCTAssertTrue((screenshot["description"] as? String)?.contains("separate macOS user desktop") == true)
+        let scroll = try XCTUnwrap(server.toolDefinitions.first { $0["name"] as? String == "scroll" })
+        let schema = try XCTUnwrap(scroll["inputSchema"] as? [String: Any])
+        let properties = try XCTUnwrap(schema["properties"] as? [String: Any])
+        XCTAssertNil(properties["dx"], "Session tools must not advertise unsupported horizontal scrolling")
+        XCTAssertNotNil(properties["dy"])
+        XCTAssertTrue((scroll["description"] as? String)?.contains("drag a horizontal scrollbar") == true)
     }
 }

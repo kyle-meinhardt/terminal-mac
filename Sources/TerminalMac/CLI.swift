@@ -27,7 +27,8 @@ final class CLI {
             _ = try Arguments(tail)
             try printJSON(["architecture": "arm64", "virtualizationSupported": String(VZVirtualMachine.isSupported),
                            "macOS": ProcessInfo.processInfo.operatingSystemVersionString, "dataDirectory": store.root.path,
-                           "guestToolsBundled": String(FileManager.default.fileExists(atPath: toolsURL.appendingPathComponent("TerminalMacGuest.app").path))])
+                           "guestToolsBundled": String(FileManager.default.fileExists(atPath: toolsURL.appendingPathComponent("TerminalMacGuest.app").path)),
+                           "sessionLibraryAvailable": String(VNCConnection.available)])
         case "image":
             let args = try Arguments(tail, options: ["output"])
             guard args.positionals.isEmpty else { throw Failure("Usage: terminal-mac image [--output /path/to/restore.ipsw]") }

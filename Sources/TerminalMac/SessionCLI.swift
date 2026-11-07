@@ -127,7 +127,7 @@ extension CLI {
     view [NAME] --read-only        Verify the separate desktop before approving input
       [--protocol kitty|iterm]     Requires Ghostty, Kitty or iTerm2; Ctrl+] exits
     approve [NAME]                Interactively approve input to the verified desktop
-    revoke [NAME]                 Disable input for new connections
+    revoke [NAME]                 Disable input for existing and new connections
     view [NAME]                   View and control the approved desktop in a terminal
     action [NAME] status|screenshot|click|move|drag|scroll|type|key
                                   Same action arguments as the VM action command

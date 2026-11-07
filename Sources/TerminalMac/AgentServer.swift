@@ -35,6 +35,17 @@ final class AgentServer {
             if tool["name"] as? String == "status" {
                 result["description"] = "Report the Screen Sharing connection and whether session input is approved."
             }
+            if tool["name"] as? String == "type" {
+                result["description"] = "Type literal text into the focused field. Supports Basic Multilingual Plane characters, including accented text; supplementary Unicode characters such as most emoji are rejected before typing. Use key for return, tab and shortcuts."
+            }
+            if tool["name"] as? String == "scroll" {
+                result["description"] = "Scroll vertically at a point. Negative dy scrolls down the page; positive dy scrolls up. Horizontal wheel scrolling is unavailable in session mode; drag a horizontal scrollbar instead."
+                if var input = result["inputSchema"] as? [String: Any], var properties = input["properties"] as? [String: Any] {
+                    properties.removeValue(forKey: "dx")
+                    input["properties"] = properties
+                    result["inputSchema"] = input
+                }
+            }
             return result
         }
     }

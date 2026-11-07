@@ -1,10 +1,11 @@
 import Foundation
+import LocalAuthentication
 import Security
 import Darwin
 import TerminalMacCore
 
 /// A local Screen Sharing connection. Credentials are stored separately in Keychain.
-struct SessionProfile: Codable {
+struct SessionProfile: Codable, Sendable {
     var name: String
     var host: String
     var port: Int
@@ -26,7 +27,7 @@ struct SessionProfile: Codable {
     }
 }
 
-struct SessionProfiles {
+struct SessionProfiles: Sendable {
     let root: URL
     init(store: Store) { root = store.root.appendingPathComponent("sessions") }
     func directory(_ name: String) throws -> URL {
@@ -52,6 +53,15 @@ struct SessionProfiles {
         try data.write(to: file, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
     }
+    /// Re-read at the point of execution, including after Keychain and network
+    /// setup. Approval observed before either wait must not authorize later input.
+    func requireInputApproval(for profile: SessionProfile) throws {
+        let current = try load(profile.name)
+        guard current.inputApproved, current.host == profile.host, current.port == profile.port,
+              current.username == profile.username else {
+            throw Failure("Session input is disabled or its target changed. Inspect `terminal-mac session view \(profile.name) --read-only`, then run `terminal-mac session approve \(profile.name)`.")
+        }
+    }
     private func query(_ name: String) -> [String: Any] {
         // Include the data root so alternate TERMINAL_MAC_HOME profiles do not share secrets.
         [kSecClass as String: kSecClassGenericPassword,
@@ -74,9 +84,19 @@ struct SessionProfiles {
         var item = query(name)
         item[kSecReturnData as String] = true
         item[kSecMatchLimit as String] = kSecMatchLimitOne
+        // MCP runs without an interactive terminal. Fail promptly instead of
+        // leaving an invisible Keychain authorization dialog blocking the tool.
+        if isatty(STDIN_FILENO) == 0 {
+            let context = LAContext()
+            context.interactionNotAllowed = true
+            item[kSecUseAuthenticationContext as String] = context
+        }
         var result: CFTypeRef?
         let status = SecItemCopyMatching(item as CFDictionary, &result)
         guard status == errSecSuccess, let data = result as? Data, let password = String(data: data, encoding: .utf8) else {
+            if status != errSecItemNotFound {
+                throw Failure("Keychain access requires authorization (\(status)). Run `terminal-mac session action \(name) status` in your own terminal and allow access to the saved agent password. Choose Always Allow to enable background agent tools.")
+            }
             throw Failure("Session credential unavailable in Keychain (\(status)). Run: terminal-mac session configure \(name)")
         }
         return password
@@ -105,8 +125,15 @@ final class KeychainSessionConnection: SessionConnection {
     }
     func call(_ request: Request) async throws -> VNCResponse {
         if connection == nil {
-            connection = try VNCConnection(host: profile.host, port: profile.port, username: profile.username,
-                                           password: profiles.readPassword(profile.name))
+            let budget = request.deadline.timeIntervalSinceNow
+            guard budget > 0 else { throw Failure("Session request expired before execution") }
+            let opened = try VNCConnection(host: profile.host, port: profile.port, username: profile.username,
+                                           password: profiles.readPassword(profile.name),
+                                           inputAuthorization: { [profiles, profile] in try profiles.requireInputApproval(for: profile) })
+            connection = opened
+            // A Keychain authorization prompt can outlast the action timeout.
+            // Start the first action's budget after that one-time authorization.
+            return try await opened.call(Request(action: request.action, arguments: request.arguments, timeout: budget))
         }
         guard let connection else { throw Failure("Session connection unavailable") }
         return try await connection.call(request)

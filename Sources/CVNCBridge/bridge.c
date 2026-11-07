@@ -16,6 +16,7 @@ static pthread_once_t once = PTHREAD_ONCE_INIT;
 static int (*virtual_session)(rfbClient *);
 static uint32_t (*last_message)(rfbClient *), (*last_encoding)(rfbClient *);
 static rfbBool (*scroll_event)(rfbClient *, int, int, int, int);
+static uint32_t (*last_stage)(void), (*last_flags)(void), (*last_allowed)(void), (*last_status)(void);
 #define FUNCTIONS(X) \
  X(rfbGetClient) X(rfbClientCleanup) X(rfbInitClient) X(SetClientAuthSchemes) \
  X(rfbClientSetClientData) X(rfbClientGetClientData) X(WaitForMessage) \
@@ -33,6 +34,10 @@ static int try_library(const char *path) {
     library = candidate;
     last_message = dlsym(candidate, "terminal_mac_last_message");
     last_encoding = dlsym(candidate, "terminal_mac_last_encoding");
+    last_stage = dlsym(candidate, "terminal_mac_last_stage");
+    last_flags = dlsym(candidate, "terminal_mac_last_flags");
+    last_allowed = dlsym(candidate, "terminal_mac_last_allowed");
+    last_status = dlsym(candidate, "terminal_mac_last_status");
     return 1;
 }
 static void load_library(void) {
@@ -66,7 +71,7 @@ struct TMVNC {
     char *username, *password;
     uint8_t *pixels;
     uint64_t sequence;
-    int pixels_changed;
+    int pixels_changed, has_frame;
     int width, height;
     char error[256];
 };
@@ -85,6 +90,7 @@ static rfbBool allocate_frame(rfbClient *client) {
     free(c->pixels); c->pixels = pixels;
     c->width = (int)w; c->height = (int)h;
     c->pixels_changed = 0;
+    c->has_frame = 0;
     client->frameBuffer = pixels;
     return TRUE;
 }
@@ -96,7 +102,7 @@ static void frame_finished(rfbClient *client) {
     TMVNC *c = state(client);
     // DisplayInfo and other pseudo-rectangles can complete an update before a
     // single pixel is received. Never publish the freshly calloc'd black buffer.
-    if (c->pixels_changed) { c->sequence++; c->pixels_changed = 0; }
+    if (c->pixels_changed) { c->sequence++; c->pixels_changed = 0; c->has_frame = 1; }
 }
 static rfbCredential *credential(rfbClient *client, int kind) {
     if (kind != rfbCredentialTypeUser) return NULL;
@@ -144,7 +150,7 @@ int tm_vnc_connect(TMVNC *c) {
     if (!api_rfbInitClient(c->client, &argc, NULL)) {
         // rfbInitClient already frees its client on failure, but not our framebuffer.
         c->client = NULL;
-        if (!c->error[0]) set_error(c, "Screen Sharing connection/authentication failed. Check the tunnel, agent account password and Screen Sharing access.");
+        if (!c->error[0]) snprintf(c->error, sizeof(c->error), "Screen Sharing handshake failed (stage=%u, flags=%u, allowed=%u, status=%u). Check the agent login, tunnel and Screen Sharing access.", last_stage ? last_stage() : 0, last_flags ? last_flags() : UINT32_MAX, last_allowed ? last_allowed() : UINT32_MAX, last_status ? last_status() : UINT32_MAX);
         return 0;
     }
     if (!virtual_session(c->client)) {
@@ -175,7 +181,7 @@ void tm_vnc_destroy(TMVNC *c) {
 const char *tm_vnc_error(TMVNC *c) { return c ? c->error : "Cannot initialize LibVNCClient"; }
 int tm_vnc_width(TMVNC *c) { return c->width; }
 int tm_vnc_height(TMVNC *c) { return c->height; }
-uint64_t tm_vnc_sequence(TMVNC *c) { return c->sequence; }
+uint64_t tm_vnc_sequence(TMVNC *c) { return c->has_frame ? c->sequence : 0; }
 const uint8_t *tm_vnc_pixels(TMVNC *c) { return c->pixels; }
 int tm_vnc_poll(TMVNC *c, unsigned int milliseconds) {
     if (!c || !c->client) return -1;
