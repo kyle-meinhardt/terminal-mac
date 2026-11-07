@@ -31,9 +31,9 @@ final class TerminalViewer {
         Shortcut(key: "z", label: "Undo", chord: "cmd+z", glyph: "⌘Z"), Shortcut(key: ",", label: "Settings", chord: "cmd+,", glyph: "⌘,")
     ]
 
-    let mailbox: Mailbox
+    let mailbox: any DesktopBackend
     /// Lifecycle control for the VM process, used to show its native window for logging in.
-    let host: Mailbox
+    let host: Mailbox?
     let directory: URL
     let machine: Machine
     let graphics: String
@@ -64,9 +64,20 @@ final class TerminalViewer {
     /// Set once a guest helper has answered, so later runs of `up` can skip the native setup window.
     static func readyMarker(_ directory: URL) -> URL { directory.appendingPathComponent("guest-ready") }
 
-    init(directory: URL, machine: Machine, graphics: String?, readOnly: Bool) throws {
-        mailbox = try Mailbox(directory.appendingPathComponent("exchange"))
-        host = try Mailbox(directory.appendingPathComponent("host-control"), create: true)
+    convenience init(directory: URL, machine: Machine, graphics: String?, readOnly: Bool) throws {
+        try self.init(backend: VMDesktopBackend(directory: directory), directory: directory,
+                      machine: machine, graphics: graphics, readOnly: readOnly)
+    }
+
+    convenience init(backend: any DesktopBackend, name: String, graphics: String?, readOnly: Bool) throws {
+        try self.init(backend: backend, directory: FileManager.default.temporaryDirectory,
+                      machine: Machine(name: name, cpu: 0, memoryGiB: 0, diskGiB: 0),
+                      graphics: graphics, readOnly: readOnly)
+    }
+
+    private init(backend: any DesktopBackend, directory: URL, machine: Machine, graphics: String?, readOnly: Bool) throws {
+        mailbox = backend
+        host = backend.isVirtualMachine ? try Mailbox(directory.appendingPathComponent("host-control"), create: true) : nil
         self.directory = directory; self.machine = machine; self.readOnly = readOnly
         points = (machine.width, machine.height)
         let env = ProcessInfo.processInfo.environment
@@ -184,7 +195,7 @@ final class TerminalViewer {
                         link = .live
                         renderer.submit(.pixels(data, width: width, height: height, bytesPerRow: stride))
                     } else {
-                        link = .snapshots
+                        link = mailbox.isVirtualMachine ? .snapshots : .live
                         renderer.submit(.encoded(data))
                         try await Task.sleep(nanoseconds: 120_000_000)
                     }
@@ -207,21 +218,27 @@ final class TerminalViewer {
 
     private func checkGrants() async {
         grantsCheckedAt = Date()
+        if !mailbox.isVirtualMachine { grants = (true, true); return }
         guard let values = try? await mailbox.call(Request(action: "status", timeout: 3)).values,
               let screen = values["screenRecording"], let input = values["accessibility"] else { return }
         grants = (screen == "true", input == "true")
     }
     /// The guest answered: remember that, and put away a window the viewer opened once nothing is left to do in it.
     private func connected() {
+        guard mailbox.isVirtualMachine else { return }
         if !FileManager.default.fileExists(atPath: Self.readyMarker(directory).path) {
             FileManager.default.createFile(atPath: Self.readyMarker(directory).path, contents: nil, attributes: [.posixPermissions: 0o600])
         }
         guard loginWindow, !inputBlocked else { return }
         loginWindow = false
         record("Guest ready · back in the terminal", ok: true)
-        Task { @MainActor in _ = try? await host.call(Request(action: "hide", timeout: 5)) }
+        Task { @MainActor in _ = try? await host?.call(Request(action: "hide", timeout: 5)) }
     }
     private func openLoginWindow() {
+        guard let host else {
+            record("Open Screen Sharing to sign in to the configured account", ok: false)
+            return
+        }
         loginWindow = true
         record("Opened the VM window · it hides once the guest is ready", ok: true)
         Task { @MainActor in
@@ -291,13 +308,13 @@ final class TerminalViewer {
         case .snapshots: [Span("◐ ", Theme.yellow), Span("snapshots", Theme.yellow), Span(" · old guest helper: open My Shared Files/tools/TerminalMacGuest in the VM", Theme.faint)]
         case .login: [Span("◌ ", Theme.yellow), Span("at login screen", Theme.yellow)]
         case .permissions: [Span("◌ ", Theme.yellow), Span("needs permissions", Theme.yellow)]
-        case .waiting: [Span("\(spin) ", Theme.yellow), Span("waiting for guest", Theme.yellow)]
+        case .waiting: [Span("\(spin) ", Theme.yellow), Span(mailbox.isVirtualMachine ? "waiting for guest" : "waiting for session", Theme.yellow)]
         }
         let latency = activity.last?.milliseconds.map { [Span("  \(Int($0.rounded())) ms", Theme.faint)] } ?? []
         let blocked = stats.frames > 0 && inputBlocked && !readOnly ? [Span("  ⚠ input needs Accessibility", Theme.yellow)] : []
-        let right = (readOnly ? [Span("view only  ", Theme.faint)] : []) + state + blocked + latency + [Span(" ")]
+        let right = (readOnly ? [Span("view only  ", Theme.yellow)] : []) + state + blocked + latency + [Span(" ")]
         var left = [Span(" ◆ terminal-mac ", Theme.badge), Span("  "), Span(machine.name, Theme.bold + Theme.text)]
-        let detail = [Span("  macOS", Theme.muted), Span(" · \(points.width)×\(points.height)", Theme.faint),
+        let detail = [Span(mailbox.isVirtualMachine ? "  macOS" : "  Screen Sharing", Theme.muted), Span(" · \(points.width)×\(points.height)", Theme.faint),
                       Span(stats.sourceWidth > 0 ? " · \(stats.sourceWidth)×\(stats.sourceHeight) px" : "", Theme.faint)]
         for count in stride(from: detail.count, through: 0, by: -1) where left.width + Array(detail.prefix(count)).width + right.width + 2 <= cols {
             left += detail.prefix(count); break
@@ -354,7 +371,7 @@ final class TerminalViewer {
             let fitted = toast.truncated(max(4, cols - quitHint.width - 3))
             footer += fitted + [Span(String(repeating: " ", count: max(1, cols - 1 - fitted.width - quitHint.width)))]
         } else {
-            let hints = link == .login || link == .connecting || link == .permissions || stats.frames == 0 ? [("⌃O", "open VM window")] :
+            let hints = !mailbox.isVirtualMachine && stats.frames == 0 ? [] : link == .login || link == .connecting || link == .permissions || stats.frames == 0 ? [("⌃O", "open VM window")] :
                 readOnly ? [] : (inputBlocked ? [("⌃O", "allow Accessibility")] : []) + [("⌃G", "Mac shortcuts"), ("click", "click"), ("drag", "select"), ("wheel", "scroll"), ("type", "keyboard")]
             for (key, action) in hints {
                 let item = hint(key, action)
@@ -466,7 +483,7 @@ final class TerminalViewer {
         func flush() { if !text.isEmpty { enqueue("type", ["text": text], label: Self.typeLabel(text)); text = "" } }
         for event in events {
             if case .quit = event { quit = true; return }
-            if case .key("ctrl+o") = event, (link != .live && link != .snapshots) || inputBlocked { openLoginWindow(); continue }
+            if case .key("ctrl+o") = event, mailbox.isVirtualMachine, (link != .live && link != .snapshots) || inputBlocked { openLoginWindow(); continue }
             guard !readOnly else { continue }
             if palette {
                 switch event {

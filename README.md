@@ -10,6 +10,14 @@ A separate macOS desktop for computer-use agents, viewed and controlled from a t
 
 The guest is a separate Mac: it has its own apps, files, accounts and permissions. It does not inherit your running host apps or signed-in sessions. The VM still consumes host CPU, memory and storage.
 
+## This fork: a second user session without a VM
+
+This fork adds a **Screen Sharing session backend** for a separate macOS user account on the same Mac. It reuses the terminal viewer and MCP controls without downloading or installing another copy of macOS. The original VM commands below remain available.
+
+Start with [the session setup guide](docs/SESSIONS.md): create the second account, establish the local Screen Sharing connection, configure its credential in Keychain, and inspect the terminal preview before enabling input. A separate user session shares the underlying OS; it does not have VM isolation. Apple authentication alone does not verify which graphical desktop a VNC connection receives, so live target verification is required.
+
+Build this fork from source with `scripts/build-session-library.sh` and the dependencies listed in the session guide. A patched client explicitly requests a virtual user desktop and rejects console-only connections. The upstream installer below installs upstream releases and does not provide these session commands. See [third-party notices](THIRD_PARTY_NOTICES.md) for LibVNCClient's GPL license and combined-program distribution terms.
+
 ## Requirements
 
 - Apple silicon Mac, macOS 14 or later.
@@ -53,7 +61,7 @@ terminal-mac skills install                 # → ~/.claude/skills/terminal-mac/
 
 **Any agent with a skills folder:** `terminal-mac skills install --dir PATH`, or `npx skills add govijr/terminal-mac --skill terminal-mac`. In an `AGENTS.md`, a line like "Before using the virtual Mac, run `terminal-mac skills get`" gives the agent instructions that match the installed version.
 
-The tools only drive the guest helper. They never touch your own desktop. When the guest is at its login screen, they say so, so the agent can ask you to sign in.
+In VM mode, the tools only drive the guest helper. They never touch your own desktop. When the guest is at its login screen, they say so, so the agent can ask you to sign in. The separate-user session backend is documented in [docs/SESSIONS.md](docs/SESSIONS.md).
 
 ## One-time guest setup
 
@@ -156,7 +164,7 @@ VM data lives in `~/Library/Application Support/terminal-mac/machines/NAME/`. `T
 
 An interrupted or failed installation leaves its directory and `installed: false` for diagnosis. It is never silently overwritten. To retry, ensure no installer/VM is running, move that incomplete directory aside, then create the VM again. There is deliberately no destructive VM-delete command yet.
 
-## Isolation model
+## VM isolation model
 
 - Host input and screen APIs are not used for agent actions. The helper refuses to run unless `hw.model` starts with `VirtualMac`. That check prevents accidental host execution; it is not hardware attestation or a defense against a compromised host.
 - The guest sees two explicit shares: `control` (read/write, containing request/reply JSON and screenshots) and `tools` (read-only helper app). Host home, project folders, clipboard, microphone, and camera are not attached.
@@ -167,6 +175,8 @@ An interrupted or failed installation leaves its directory and `installed: false
 VM cloning, rollback checkpoints, accessibility snapshots, fully unattended guest setup, terminal splits and tmux transport remain future work. The native Virtualization framework does not itself render a Mac into a terminal or offer an agent input API; this project supplies the guest transport and terminal presentation layers.
 
 ## Development and validation
+
+For this fork, first run `bash scripts/build-session-library.sh` (or `bash scripts/build.sh`) to generate the patched dependency and its matching C headers. Then run the Swift tests:
 
 ```sh
 CLANG_MODULE_CACHE_PATH=/tmp/terminal-mac-modules \

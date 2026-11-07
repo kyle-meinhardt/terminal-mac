@@ -113,6 +113,7 @@ final class CLI {
             try store.save(machine)
             try printJSON(["name": name, "display": "\(machine.width)×\(machine.height) points at \(machine.displayScale)x"])
         case "action": try await action(tail)
+        case "session": try await session(tail)
         case "mcp":
             let args = try Arguments(tail, flags: ["config"])
             let name = try args.machineName()
@@ -240,6 +241,8 @@ final class CLI {
       [--plan] [--timeout 1800] Preview steps without changes; setup wait in seconds
     setup [NAME]                Same guided flow as up
     terminal-mac                Runs up in an interactive terminal
+
+    session help                 Separate user desktop without a VM (Screen Sharing)
 
     image [--output PATH]         Find or download Apple's latest supported IPSW
     create [NAME] --ipsw PATH     Install a new virtual Mac (default name: default)

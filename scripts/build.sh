@@ -6,6 +6,9 @@ if [[ "$(uname -m)" != arm64 ]]; then
   exit 1
 fi
 configuration="${CONFIGURATION:-release}"
+# A pinned client patch explicitly requests Apple's separate user session. Ordinary VNC
+# libraries cannot guarantee that selection, so session mode refuses them.
+bash scripts/build-session-library.sh
 source scripts/release-config.sh
 identity="${SIGN_IDENTITY:-}"
 # A stable identity keeps the guest helper's Screen Recording and Accessibility approvals across
@@ -35,7 +38,16 @@ swift build "${build_options[@]}" -c "$configuration"
 binary_dir="$(swift build "${build_options[@]}" -c "$configuration" --show-bin-path)"
 app="$PWD/dist/TerminalMac.app"
 guest="$app/Contents/Resources/guest-tools/TerminalMacGuest.app"
-mkdir -p "$app/Contents/MacOS" "$guest/Contents/MacOS"
+mkdir -p "$app/Contents/MacOS" "$guest/Contents/MacOS" "$app/Contents/Frameworks"
+for library in .build/session-libs/*.dylib; do
+  destination="$app/Contents/Frameworks/$(basename "$library")"
+  cp "$library" "$destination.new"
+  mv -f "$destination.new" "$destination"
+done
+# The VM guest does not load the optional session library. Keep it out of guest tools.
+for library in "$app"/Contents/Frameworks/*.dylib; do
+  codesign --force --sign "$identity" "${sign_options[@]}" "$library"
+done
 # Replace rather than overwrite: rewriting a running VM's executable in place can kill it.
 rm -f "$app/Contents/MacOS/terminal-mac" "$guest/Contents/MacOS/terminal-mac"
 cp "$binary_dir/terminal-mac" "$app/Contents/MacOS/terminal-mac"
@@ -58,6 +70,12 @@ mkdir -p "$app/Contents/Resources/skills"
 cp -R skills/terminal-mac "$app/Contents/Resources/skills/"
 make_plist "$guest/Contents/Info.plist" dev.terminal-mac.guest TerminalMacGuest
 make_plist "$app/Contents/Info.plist" dev.terminal-mac.host TerminalMac
+mkdir -p "$app/Contents/Resources/licenses"
+cp LICENSE THIRD_PARTY_NOTICES.md "$app/Contents/Resources/licenses/"
+cp licenses/* "$app/Contents/Resources/licenses/"
+cp -R patches "$app/Contents/Resources/licenses/"
+cp .build/session-library/source.tar.gz "$app/Contents/Resources/licenses/libvncclient-source.tar.gz"
+cp scripts/build-session-library.sh "$app/Contents/Resources/licenses/"
 # Guest has no Virtualization entitlement. Its guarded mode only controls the VM desktop.
 codesign --force --sign "$identity" "${sign_options[@]}" "$guest"
 codesign --force --sign "$identity" "${sign_options[@]}" --entitlements resources/terminal-mac.entitlements "$app"

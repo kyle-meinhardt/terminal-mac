@@ -12,7 +12,32 @@ import UniformTypeIdentifiers
 final class AgentServer {
     let store: Store
     let name: String
-    init(store: Store, name: String) { self.store = store; self.name = name }
+    let backend: (any DesktopBackend)?
+    init(store: Store, name: String) { self.store = store; self.name = name; backend = nil }
+    init(backend: any DesktopBackend, name: String) { store = Store(); self.name = name; self.backend = backend }
+    private var sessionMode: Bool { backend?.isVirtualMachine == false }
+    var serverInstructions: String { sessionMode ? Self.sessionInstructions : Self.instructions }
+    private static let sessionInstructions = """
+    Controls a separate macOS user session through Screen Sharing on the user's physical Mac.
+    It is not a VM. Call screenshot first and verify the expected separate account desktop.
+    All coordinates are pixels in that screenshot, with top-left origin. Take screenshots after
+    actions to verify results. If the screen is a login, account-selection or permission prompt,
+    ask the user to handle it. Do not switch to or control the user's physical desktop.
+    Input requires the user's prior approval through `terminal-mac session approve`.
+    """
+    var toolDefinitions: [[String: Any]] {
+        guard sessionMode else { return Self.tools }
+        return Self.tools.map { tool in
+            var result = tool
+            if tool["name"] as? String == "screenshot" {
+                result["description"] = "Capture the separate macOS user desktop. Other tools use pixels in this image."
+            }
+            if tool["name"] as? String == "status" {
+                result["description"] = "Report the Screen Sharing connection and whether session input is approved."
+            }
+            return result
+        }
+    }
 
     static let instructions = """
     Controls a separate virtual Mac, not the user's own desktop. Call `screenshot` first; every \
@@ -60,9 +85,9 @@ final class AgentServer {
                     "protocolVersion": params["protocolVersion"] as? String ?? "2025-06-18",
                     "capabilities": ["tools": [:]],
                     "serverInfo": ["name": "terminal-mac", "version": appVersion],
-                    "instructions": Self.instructions]])
+                    "instructions": serverInstructions]])
             case "ping": send(["jsonrpc": "2.0", "id": id, "result": [:]])
-            case "tools/list": send(["jsonrpc": "2.0", "id": id, "result": ["tools": Self.tools]])
+            case "tools/list": send(["jsonrpc": "2.0", "id": id, "result": ["tools": toolDefinitions]])
             case "tools/call":
                 let tool = params["name"] as? String ?? ""
                 let arguments = params["arguments"] as? [String: Any] ?? [:]
@@ -73,7 +98,7 @@ final class AgentServer {
         }
     }
 
-    private func call(_ tool: String, _ a: [String: Any]) async throws -> [[String: Any]] {
+    func call(_ tool: String, _ a: [String: Any]) async throws -> [[String: Any]] {
         func int(_ key: String) throws -> String {
             guard let number = a[key] as? NSNumber,
                   CFGetTypeID(number) != CFBooleanGetTypeID(),
@@ -92,7 +117,7 @@ final class AgentServer {
         case "status":
             let reply = try await guest(Request(action: "status", timeout: 5))
             let summary = reply.values.sorted { $0.key < $1.key }.map { "\($0.key): \($0.value)" }.joined(separator: "\n")
-            return [["type": "text", "text": "VM '\(name)' is running.\n" + summary]]
+            return [["type": "text", "text": (sessionMode ? "Session '\(name)' is connected.\n" : "VM '\(name)' is running.\n") + summary]]
         case "click":
             var base = ["x": try int("x"), "y": try int("y")]
             if a["button"] as? String == "right" { base["button"] = "right" }
@@ -130,7 +155,7 @@ final class AgentServer {
         let reply = try await guest(request, mailbox: mailbox)
         guard reply.values["image"] == imageName, let png = try mailbox.read(imageName, limit: 64 * 1024 * 1024),
               let source = CGImageSourceCreateWithData(png as CFData, nil), let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
-            throw Failure("The guest helper returned an invalid screenshot")
+            throw Failure("The desktop backend returned an invalid screenshot")
         }
         let jpeg = NSMutableData()
         guard let destination = CGImageDestinationCreateWithData(jpeg, UTType.jpeg.identifier as CFString, 1, nil) else { throw Failure("Cannot encode screenshot") }
@@ -140,13 +165,17 @@ final class AgentServer {
                 ["type": "text", "text": "Screen: \(image.width)×\(image.height). Use these pixel coordinates."]]
     }
 
-    private func exchange() throws -> Mailbox { try Mailbox(store.directory(name).appendingPathComponent("exchange")) }
-    private func guest(_ request: Request, mailbox: Mailbox? = nil) async throws -> Reply {
+    private func exchange() throws -> any DesktopBackend {
+        if let backend { return backend }
+        return try VMDesktopBackend(directory: store.directory(name))
+    }
+    private func guest(_ request: Request, mailbox: (any DesktopBackend)? = nil) async throws -> Reply {
         try requireRunning()
         return try await (mailbox ?? exchange()).call(request)
     }
     /// Checked per call, so the server starts (and lists its tools) before any VM exists.
     private func requireRunning() throws {
+        if backend != nil { return }
         guard (try? store.load(name)) != nil else {
             throw Failure("No virtual Mac named '\(name)' exists yet. Ask the user to run `terminal-mac up\(name == "default" ? "" : " " + name)`; it downloads macOS and needs them for first-time setup.")
         }
